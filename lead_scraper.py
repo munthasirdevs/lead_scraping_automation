@@ -177,6 +177,22 @@ async def scrape_google_maps(
             scroll_count += 1
             print(f"  Total collected so far: {len(results)}\n")
 
+            # Try to load more results on Google Maps
+            if scroll_count < max_scrolls:
+                try:
+                    # Look for "Show more" button on Google Maps
+                    show_more = await page.query_selector('button[aria-label="More"]')
+                    if not show_more:
+                        show_more = await page.query_selector(
+                            'button:mmhas-text("More")'
+                        )
+                    if show_more:
+                        await show_more.click()
+                        await asyncio.sleep(3)
+                        print(f"  [>>] Loaded more results")
+                except:
+                    pass
+
             if len(results) >= SEARCH_CONFIG["results_limit"]:
                 print(
                     f"\n[INFO] Reached results limit: {SEARCH_CONFIG['results_limit']}"
@@ -199,7 +215,7 @@ async def scrape_google_dork(
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
-            headless=True,
+            headless=False,  # Non-headless for Google
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--disable-dev-shm-usage",
@@ -218,20 +234,20 @@ async def scrape_google_dork(
 
         print("[OK] Browser initialized with stealth mode")
 
-        # Combine keywords with dork query
+        # Use Yahoo for dorking (Google/Bing block automated requests)
         search_query = f"{keywords} {dork_query}".strip()
-        print(f"[LOAD] Searching Google: {search_query}...")
+        print(f"[LOAD] Searching Yahoo: {search_query}...")
 
         try:
             await page.goto(
-                f"https://www.google.com/search?q={search_query.replace(' ', '+')}&num=100",
+                f"https://search.yahoo.com/search?p={search_query.replace(' ', '+')}",
                 wait_until="domcontentloaded",
                 timeout=60000,
             )
             print("[OK] Search results loaded")
         except Exception as e:
             print(f"[WARN] Load issue: {e}")
-            await page.wait_for_timeout(5000)
+            await page.wait_for_timeout(10000)
 
         await asyncio.sleep(3)
 
@@ -250,10 +266,9 @@ async def scrape_google_dork(
             await asyncio.sleep(2)
 
             try:
-                # Get search result containers
-                result_blocks = await page.query_selector_all(
-                    'div.g, div[data-kb-ctrl-id="search_results"]'
-                )
+                # Bing result selectors
+                # Yahoo result selectors
+                result_blocks = await page.query_selector_all("div.algo, li.algo")
                 new_count = 0
 
                 for block in result_blocks:
@@ -321,6 +336,29 @@ async def scrape_google_dork(
                 pass
 
             print(f" | New: {new_count} | Total: {len(results)}")
+
+            # Try to go to next page if no new results or after each scroll
+            if new_count == 0 or scroll_count < max_scrolls - 1:
+                try:
+                    next_button = await page.query_selector(
+                        'a[href*="page="], a.next, a.pagination-next'
+                    )
+                    if next_button:
+                        await next_button.click()
+                        await asyncio.sleep(3)
+                        print(f"  [>>] Moved to next page")
+                        continue
+
+                    # Try Yahoo specific next button
+                    next_link = await page.query_selector('a[aria-label="Next"]')
+                    if next_link:
+                        await next_link.click()
+                        await asyncio.sleep(3)
+                        print(f"  [>>] Moved to next page")
+                        continue
+                except:
+                    pass
+
             scroll_count += 1
 
             if len(results) >= SEARCH_CONFIG["results_limit"]:
