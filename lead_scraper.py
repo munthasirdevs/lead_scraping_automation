@@ -77,6 +77,7 @@ SEARCH_CONFIG = {
     "results_limit": 100,
     "search_type": "maps",
     "dork_query": "",
+    "target": "email",
 }
 
 PHONE_REGEX = r"(\(\d{3}\)\s*\d{3}[-\s]?\d{4}|\+\d{1,3}[-.\s]?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4})"
@@ -86,6 +87,69 @@ DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.
 DEFAULT_VIEWPORT = {"width": 1920, "height": 1080}  # type: ignore[assignment]
 
 rate_limiter = RateLimiter(min_delay=1.0, max_delay=2.5)
+
+
+def is_valid_profile_url(url: str) -> bool:
+    """Check if URL is a valid social media profile (not generic pages)."""
+    if not url:
+        return False
+
+    url_lower = url.lower()
+
+    if "facebook.com" in url_lower or "fb.com" in url_lower:
+        invalid = [
+            "/help/",
+            "/login",
+            "/accounts/",
+            "/photo",
+            "/video",
+            "/story",
+            "/groups/",
+            "/pages/",
+            "/apps/",
+            "/events/",
+        ]
+        if any(x in url_lower for x in invalid):
+            return False
+        return True
+
+    if "instagram.com" in url_lower:
+        invalid_patterns = [
+            "/help/",
+            "/login",
+            "/accounts/",
+            "/reels/",
+            "/reel/",
+            "/p/",
+            "/popular/",
+            "/explore/",
+            "/about-us/",
+            "/?hl=",
+            "/tags/",
+            "/stories/",
+            "/direct/",
+            "/settings/",
+            "/notifications/",
+            "/search/",
+            "/activity/",
+            "/archive/",
+            "/fundraiser/",
+            "/ads/",
+            "/business/",
+            "/developers/",
+            "/legal/",
+            "/about/",
+        ]
+        if any(pattern in url_lower for pattern in invalid_patterns):
+            return False
+        match = re.search(r"instagram\.com/([a-zA-Z0-9_.]+)/?$", url_lower)
+        if match:
+            username = match.group(1)
+            if len(username) > 2 and "/" not in username:
+                return True
+        return False
+
+    return False
 
 
 async def human_like_scroll(
@@ -197,12 +261,13 @@ async def scrape_google_maps(
     keywords: str,
     location: str,
     max_scrolls: int = 15,
+    headless: bool = False,
 ) -> list[dict[str, str]]:
     """Scrape business listings from Google Maps."""
     results: list[dict[str, str]] = []
 
-    p, browser, page = await _initialize_browser(headless=True)
-    logger.info("Browser initialized with stealth mode")
+    p, browser, page = await _initialize_browser(headless=headless)
+    logger.info(f"Browser initialized (headless={headless})")
 
     try:
         search_query = f"{keywords} in {location}"
@@ -290,17 +355,20 @@ async def scrape_google_maps(
     return results
 
 
-async def scrape_google_dork(
+async def scrape_yahoo_dork(
     keywords: str,
     dork_query: str,
     max_scrolls: int = 15,
+    headless: bool = False,
+    target: str = "email",
 ) -> list[dict[str, str]]:
     """Scrape using Google Dorking - searches for emails/contacts via Yahoo."""
     results: list[dict[str, str]] = []
     seen_emails: set[str] = set()
+    seen_profiles: set[str] = set()
 
-    p, browser, page = await _initialize_browser(headless=False)
-    logger.info("Browser initialized with stealth mode")
+    p, browser, page = await _initialize_browser(headless=headless)
+    logger.info(f"Browser initialized (headless={headless})")
 
     try:
         search_query = f"{keywords} {dork_query}".strip()
@@ -337,56 +405,100 @@ async def scrape_google_dork(
                     try:
                         text = await block.inner_text()
 
-                        emails = re.findall(EMAIL_REGEX, text)
-                        for email in emails:
-                            email_lower = email.lower()
-                            if (
-                                email_lower not in seen_emails
-                                and not email_lower.endswith("@example.com")
-                            ):
-                                seen_emails.add(email_lower)
+                        if target == "profile":
+                            link = await block.query_selector("a")
+                            if link:
+                                href = await link.get_attribute("href")
+                                if is_valid_profile_url(href):
+                                    profile_key = href
+                                    if profile_key not in seen_profiles:
+                                        seen_profiles.add(profile_key)
+                                        result = {
+                                            "Business Name": "",
+                                            "Phone Number": "",
+                                            "Website": "",
+                                            "Email": "",
+                                            "Source": "Yahoo Search",
+                                        }
+                                        result["Website"] = href
+                                        try:
+                                            title = await block.query_selector("h3")
+                                            if title:
+                                                result["Business Name"] = (
+                                                    await title.inner_text()
+                                                ).strip()[:100]
+                                        except Exception:
+                                            logger.debug(
+                                                "Failed to extract title from result"
+                                            )
 
-                                result: dict[str, str] = {
-                                    "Business Name": "",
-                                    "Phone Number": "",
-                                    "Website": "",
-                                    "Email": email,
-                                    "Source": "Yahoo Search",
-                                }
+                                        emails = re.findall(EMAIL_REGEX, text)
+                                        for email in emails:
+                                            email_lower = email.lower()
+                                            if not email_lower.endswith("@example.com"):
+                                                result["Email"] = email_lower
+                                                break
 
-                                try:
-                                    link = await block.query_selector("a")
-                                    if link:
-                                        href = await link.get_attribute("href")
-                                        if (
-                                            href
-                                            and href.startswith("http")
-                                            and "yahoo" not in href
-                                        ):
-                                            result["Website"] = href
-                                except Exception:
-                                    logger.debug(
-                                        "Failed to extract website from result"
-                                    )
+                                        phones = re.findall(PHONE_REGEX, text)
+                                        if phones:
+                                            result["Phone Number"] = phones[0].strip()
 
-                                try:
-                                    title = await block.query_selector("h3")
-                                    if title:
-                                        result["Business Name"] = (
-                                            await title.inner_text()
-                                        ).strip()[:100]
-                                except Exception:
-                                    logger.debug("Failed to extract title from result")
+                                        results.append(result)
+                                        new_count += 1
+                                        logger.info(f"  + Profile: {href[:50]}")
+                        else:
+                            emails = re.findall(EMAIL_REGEX, text)
+                            for email in emails:
+                                email_lower = email.lower()
+                                if (
+                                    email_lower not in seen_emails
+                                    and not email_lower.endswith("@example.com")
+                                ):
+                                    seen_emails.add(email_lower)
 
-                                phone_match = re.search(PHONE_REGEX, text)
-                                if phone_match:
-                                    result["Phone Number"] = phone_match.group(
-                                        1
-                                    ).strip()
+                                    result = {
+                                        "Business Name": "",
+                                        "Phone Number": "",
+                                        "Website": "",
+                                        "Email": email,
+                                        "Source": "Yahoo Search",
+                                    }
 
-                                results.append(result)
-                                new_count += 1
-                                logger.info(f"  + {email[:40]}")
+                                    try:
+                                        link = await block.query_selector("a")
+                                        if link:
+                                            href = await link.get_attribute("href")
+                                            if (
+                                                href
+                                                and href.startswith("http")
+                                                and "yahoo" not in href
+                                            ):
+                                                result["Website"] = href
+                                    except Exception:
+                                        logger.debug(
+                                            "Failed to extract website from result"
+                                        )
+
+                                    try:
+                                        title = await block.query_selector("h3")
+                                        if title:
+                                            result["Business Name"] = (
+                                                await title.inner_text()
+                                            ).strip()[:100]
+                                    except Exception:
+                                        logger.debug(
+                                            "Failed to extract title from result"
+                                        )
+
+                                    phone_match = re.search(PHONE_REGEX, text)
+                                    if phone_match:
+                                        result["Phone Number"] = phone_match.group(
+                                            1
+                                        ).strip()
+
+                                    results.append(result)
+                                    new_count += 1
+                                    logger.info(f"  + {email[:40]}")
 
                     except Exception:
                         logger.debug("Failed to process result block")
@@ -398,28 +510,533 @@ async def scrape_google_dork(
 
             next_clicked = False
             if scroll_count < max_scrolls - 1:
-                try:
-                    next_button = await page.query_selector('a[href*="b="]')
-                    if next_button:
-                        await next_button.click()
-                        await asyncio.sleep(4)
-                        page_num += 1
-                        next_clicked = True
-                        logger.info(f"Moved to page {page_num}")
-                except Exception:
-                    logger.debug("Failed to click next button (b=)")
-
-                if not next_clicked:
+                next_button = (
+                    await page.query_selector('a[href*="b="]')
+                    or await page.query_selector('a[aria-label="Next"]')
+                    or await page.query_selector("a[aria-label='Next page']")
+                    or await page.query_selector("button[aria-label='Next']")
+                    or await page.query_selector("a.next")
+                )
+                if next_button:
                     try:
-                        next_link = await page.query_selector('a[aria-label="Next"]')
-                        if next_link:
-                            await next_link.click()
-                            await asyncio.sleep(4)
+                        await next_button.click()
+                        await page.wait_for_load_state("networkidle", timeout=30000)
+                        next_clicked = True
+                        page_num += 1
+                        logger.info(f"Moved to page {page_num}")
+                    except Exception:
+                        logger.debug(
+                            "Failed to click next button, trying URL navigation"
+                        )
+                        try:
+                            current_url = page.url
+                            if "b=" in current_url:
+                                match = re.search(r"b=(\d+)", current_url)
+                                if match:
+                                    new_b = int(match.group(1)) + 10
+                                    new_url = re.sub(
+                                        r"b=\d+", f"b={new_b}", current_url
+                                    )
+                                else:
+                                    new_url = f"{current_url}&b=10"
+                            else:
+                                new_url = f"{current_url}&b=10"
+                            await page.goto(
+                                new_url, wait_until="networkidle", timeout=60000
+                            )
                             page_num += 1
                             next_clicked = True
-                            logger.info(f"Moved to page {page_num}")
+                            logger.info(f"Moved to page {page_num} via URL")
+                        except Exception as e:
+                            logger.debug(f"URL navigation also failed: {e}")
+                else:
+                    logger.debug("Next button not found, trying URL navigation")
+                    try:
+                        current_url = page.url
+                        if "b=" in current_url:
+                            match = re.search(r"b=(\d+)", current_url)
+                            if match:
+                                new_b = int(match.group(1)) + 10
+                                new_url = re.sub(r"b=\d+", f"b={new_b}", current_url)
+                            else:
+                                new_url = f"{current_url}&b=10"
+                        else:
+                            new_url = f"{current_url}&b=10"
+                        await page.goto(
+                            new_url, wait_until="networkidle", timeout=60000
+                        )
+                        page_num += 1
+                        next_clicked = True
+                        logger.info(f"Moved to page {page_num} via URL")
+                    except Exception as e:
+                        logger.debug(f"URL navigation failed: {e}")
+
+            scroll_count += 1
+
+            if len(results) >= SEARCH_CONFIG["results_limit"]:
+                logger.info(f"Reached results limit: {SEARCH_CONFIG['results_limit']}")
+                break
+
+            if not next_clicked:
+                if scroll_count >= max_scrolls:
+                    logger.info("No more pages available")
+                    break
+                else:
+                    logger.warning(
+                        f"Failed to navigate to next page from page {page_num}, stopping"
+                    )
+                    break
+
+        logger.info(f"Scraping complete! Total results: {len(results)}")
+
+    finally:
+        await browser.close()
+        await p.stop()
+
+    return results
+
+
+async def scrape_bing_dork(
+    keywords: str,
+    dork_query: str,
+    max_scrolls: int = 15,
+    headless: bool = False,
+    target: str = "email",
+) -> list[dict[str, str]]:
+    """Scrape using Bing Dorking - searches for emails/contacts via Bing."""
+    results: list[dict[str, str]] = []
+    seen_emails: set[str] = set()
+    seen_profiles: set[str] = set()
+
+    p, browser, page = await _initialize_browser(headless=headless)
+    logger.info(f"Browser initialized (headless={headless})")
+
+    try:
+        search_query = f"{keywords} {dork_query}".strip()
+        logger.info(f"Searching Bing: {search_query}")
+
+        try:
+            await page.goto(
+                f"https://www.bing.com/search?q={search_query.replace(' ', '+')}",
+                wait_until="domcontentloaded",
+                timeout=60000,
+            )
+            logger.info("Search results loaded")
+        except Exception as e:
+            logger.warning(f"Load issue: {e}")
+            await page.wait_for_timeout(10000)
+
+        await asyncio.sleep(3)
+        logger.info(f"Scraping results (max: {max_scrolls} scrolls)")
+
+        scroll_count = 0
+        page_num = 1
+
+        while scroll_count < max_scrolls:
+            logger.info(f"[PAGE {page_num}/{max_scrolls}] Processing results...")
+
+            await human_like_scroll(page)
+            await asyncio.sleep(2)
+
+            try:
+                result_blocks = await page.query_selector_all("li.b_algo")
+                new_count = 0
+
+                for block in result_blocks:
+                    try:
+                        text = await block.inner_text()
+
+                        if target == "profile":
+                            link = await block.query_selector("a")
+                            if link:
+                                href = await link.get_attribute("href")
+                                if is_valid_profile_url(href):
+                                    profile_key = href
+                                    if profile_key not in seen_profiles:
+                                        seen_profiles.add(profile_key)
+                                        result = {
+                                            "Business Name": "",
+                                            "Phone Number": "",
+                                            "Website": "",
+                                            "Email": "",
+                                            "Source": "Bing Search",
+                                        }
+                                        result["Website"] = href
+                                        try:
+                                            title = await block.query_selector("h3")
+                                            if title:
+                                                result["Business Name"] = (
+                                                    await title.inner_text()
+                                                ).strip()[:100]
+                                            else:
+                                                result["Business Name"] = href
+                                        except Exception:
+                                            logger.debug(
+                                                "Failed to extract title from result"
+                                            )
+                                            result["Business Name"] = href
+
+                                        emails = re.findall(EMAIL_REGEX, text)
+                                        for email in emails:
+                                            email_lower = email.lower()
+                                            if not email_lower.endswith("@example.com"):
+                                                result["Email"] = email_lower
+                                                break
+
+                                        phones = re.findall(PHONE_REGEX, text)
+                                        if phones:
+                                            result["Phone Number"] = phones[0].strip()
+
+                                        results.append(result)
+                                        new_count += 1
+                                        logger.info(f"  + Profile: {href[:50]}")
+                        else:
+                            emails = re.findall(EMAIL_REGEX, text)
+                            for email in emails:
+                                email_lower = email.lower()
+                                if (
+                                    email_lower not in seen_emails
+                                    and not email_lower.endswith("@example.com")
+                                ):
+                                    seen_emails.add(email_lower)
+
+                                    result = {
+                                        "Business Name": "",
+                                        "Phone Number": "",
+                                        "Website": "",
+                                        "Email": email,
+                                        "Source": "Bing Search",
+                                    }
+
+                                    try:
+                                        link = await block.query_selector("a")
+                                        if link:
+                                            href = await link.get_attribute("href")
+                                            if href and href.startswith("http"):
+                                                result["Website"] = href
+                                    except Exception:
+                                        logger.debug(
+                                            "Failed to extract website from result"
+                                        )
+
+                                    try:
+                                        title = await block.query_selector("h2")
+                                        if title:
+                                            result["Business Name"] = (
+                                                await title.inner_text()
+                                            ).strip()[:100]
+                                    except Exception:
+                                        logger.debug(
+                                            "Failed to extract title from result"
+                                        )
+
+                                    phone_match = re.search(PHONE_REGEX, text)
+                                    if phone_match:
+                                        result["Phone Number"] = phone_match.group(
+                                            1
+                                        ).strip()
+
+                                    results.append(result)
+                                    new_count += 1
+                                    logger.info(f"  + {email[:40]}")
+
                     except Exception:
-                        logger.debug("Failed to click next button (aria-label)")
+                        logger.debug("Failed to process result block")
+
+                logger.info(f" | New: {new_count} | Total: {len(results)}")
+
+            except Exception:
+                logger.debug("Failed to find result blocks")
+
+            next_clicked = False
+            if scroll_count < max_scrolls - 1:
+                next_button = (
+                    await page.query_selector("a.sb_pagNext")
+                    or await page.query_selector("a[aria-label='Next page']")
+                    or await page.query_selector("a[title='Next page']")
+                )
+                if next_button:
+                    try:
+                        await next_button.click()
+                        await page.wait_for_load_state("networkidle", timeout=30000)
+                        next_clicked = True
+                        page_num += 1
+                        logger.info(f"Moved to page {page_num}")
+                    except Exception:
+                        logger.debug(
+                            "Failed to click next button, trying URL navigation"
+                        )
+                        try:
+                            current_url = page.url
+                            if "first=" in current_url:
+                                new_url = re.sub(
+                                    r"first=\d+",
+                                    f"first={page_num * 10 + 1}",
+                                    current_url,
+                                )
+                            else:
+                                new_url = f"{current_url}&first={page_num * 10 + 1}"
+                            await page.goto(
+                                new_url, wait_until="networkidle", timeout=60000
+                            )
+                            page_num += 1
+                            next_clicked = True
+                            logger.info(f"Moved to page {page_num} via URL")
+                        except Exception as e:
+                            logger.debug(f"URL navigation also failed: {e}")
+                else:
+                    logger.debug("Next button not found with any selector")
+                    try:
+                        current_url = page.url
+                        if "first=" in current_url:
+                            new_url = re.sub(
+                                r"first=\d+", f"first={page_num * 10 + 1}", current_url
+                            )
+                        else:
+                            new_url = f"{current_url}&first={page_num * 10 + 1}"
+                        await page.goto(
+                            new_url, wait_until="networkidle", timeout=60000
+                        )
+                        page_num += 1
+                        next_clicked = True
+                        logger.info(f"Moved to page {page_num} via URL")
+                    except Exception as e:
+                        logger.debug(f"URL navigation failed: {e}")
+
+            scroll_count += 1
+
+            if len(results) >= SEARCH_CONFIG["results_limit"]:
+                logger.info(f"Reached results limit: {SEARCH_CONFIG['results_limit']}")
+                break
+
+            if not next_clicked and scroll_count >= max_scrolls:
+                logger.info("No more pages available")
+                break
+
+        logger.info(f"Scraping complete! Total results: {len(results)}")
+
+    finally:
+        await browser.close()
+        await p.stop()
+
+    return results
+
+
+async def scrape_google_dork(
+    keywords: str,
+    dork_query: str,
+    max_scrolls: int = 15,
+    headless: bool = False,
+    target: str = "email",
+) -> list[dict[str, str]]:
+    """Scrape using Google Dorking - searches for emails/contacts via Google."""
+    results: list[dict[str, str]] = []
+    seen_emails: set[str] = set()
+    seen_profiles: set[str] = set()
+
+    p, browser, page = await _initialize_browser(headless=headless)
+    logger.info(f"Browser initialized (headless={headless})")
+
+    try:
+        search_query = f"{keywords} {dork_query}".strip()
+        logger.info(f"Searching Google: {search_query}")
+
+        try:
+            await page.goto(
+                f"https://www.google.com/search?q={search_query.replace(' ', '+')}",
+                wait_until="domcontentloaded",
+                timeout=60000,
+            )
+            logger.info("Search results loaded")
+        except Exception as e:
+            logger.warning(f"Load issue: {e}")
+            await page.wait_for_timeout(10000)
+
+        await asyncio.sleep(3)
+
+        try:
+            captcha = await page.query_selector("form#captcha-form")
+            if captcha:
+                logger.warning(
+                    "Google CAPTCHA detected! Try using headed mode or another search engine."
+                )
+        except Exception:
+            pass
+
+        logger.info(f"Scraping results (max: {max_scrolls} scrolls)")
+
+        scroll_count = 0
+        page_num = 1
+
+        while scroll_count < max_scrolls:
+            logger.info(f"[PAGE {page_num}/{max_scrolls}] Processing results...")
+
+            await human_like_scroll(page)
+            await asyncio.sleep(2)
+
+            try:
+                result_blocks = await page.query_selector_all("div.g")
+                new_count = 0
+
+                for block in result_blocks:
+                    try:
+                        text = await block.inner_text()
+
+                        if target == "profile":
+                            link = await block.query_selector("a")
+                            if link:
+                                href = await link.get_attribute("href")
+                                if is_valid_profile_url(href):
+                                    profile_key = href
+                                    if profile_key not in seen_profiles:
+                                        seen_profiles.add(profile_key)
+                                        result = {
+                                            "Business Name": "",
+                                            "Phone Number": "",
+                                            "Website": "",
+                                            "Email": "",
+                                            "Source": "Google Search",
+                                        }
+                                        result["Website"] = href
+                                        try:
+                                            title = await block.query_selector("h3")
+                                            if title:
+                                                result["Business Name"] = (
+                                                    await title.inner_text()
+                                                ).strip()[:100]
+                                            else:
+                                                result["Business Name"] = href
+                                        except Exception:
+                                            logger.debug(
+                                                "Failed to extract title from result"
+                                            )
+                                            result["Business Name"] = href
+
+                                        emails = re.findall(EMAIL_REGEX, text)
+                                        for email in emails:
+                                            email_lower = email.lower()
+                                            if not email_lower.endswith("@example.com"):
+                                                result["Email"] = email_lower
+                                                break
+
+                                        phones = re.findall(PHONE_REGEX, text)
+                                        if phones:
+                                            result["Phone Number"] = phones[0].strip()
+
+                                        results.append(result)
+                                        new_count += 1
+                                        logger.info(f"  + Profile: {href[:50]}")
+                        else:
+                            emails = re.findall(EMAIL_REGEX, text)
+                            for email in emails:
+                                email_lower = email.lower()
+                                if (
+                                    email_lower not in seen_emails
+                                    and not email_lower.endswith("@example.com")
+                                ):
+                                    seen_emails.add(email_lower)
+
+                                    result = {
+                                        "Business Name": "",
+                                        "Phone Number": "",
+                                        "Website": "",
+                                        "Email": email,
+                                        "Source": "Google Search",
+                                    }
+
+                                    try:
+                                        link = await block.query_selector("a")
+                                        if link:
+                                            href = await link.get_attribute("href")
+                                            if href and href.startswith("http"):
+                                                result["Website"] = href
+                                    except Exception:
+                                        logger.debug(
+                                            "Failed to extract website from result"
+                                        )
+
+                                    try:
+                                        title = await block.query_selector("h3")
+                                        if title:
+                                            result["Business Name"] = (
+                                                await title.inner_text()
+                                            ).strip()[:100]
+                                    except Exception:
+                                        logger.debug(
+                                            "Failed to extract title from result"
+                                        )
+
+                                    phone_match = re.search(PHONE_REGEX, text)
+                                    if phone_match:
+                                        result["Phone Number"] = phone_match.group(
+                                            1
+                                        ).strip()
+
+                                    results.append(result)
+                                    new_count += 1
+                                    logger.info(f"  + {email[:40]}")
+
+                    except Exception:
+                        logger.debug("Failed to process result block")
+
+                logger.info(f" | New: {new_count} | Total: {len(results)}")
+
+            except Exception:
+                logger.debug("Failed to find result blocks")
+
+            next_clicked = False
+            if scroll_count < max_scrolls - 1:
+                next_button = (
+                    await page.query_selector("a#pnnext")
+                    or await page.query_selector("td.d6ravFHbMDH__button")
+                    or await page.query_selector("button[aria-label='Next page']")
+                    or await page.query_selector("a[aria-label='Next page']")
+                )
+                if next_button:
+                    try:
+                        await next_button.click()
+                        await page.wait_for_load_state("networkidle", timeout=30000)
+                        next_clicked = True
+                        page_num += 1
+                        logger.info(f"Moved to page {page_num}")
+                    except Exception:
+                        logger.debug(
+                            "Failed to click next button, trying URL navigation"
+                        )
+                        try:
+                            current_url = page.url
+                            if "start=" in current_url:
+                                new_url = re.sub(
+                                    r"start=\d+", f"start={page_num * 10}", current_url
+                                )
+                            else:
+                                new_url = f"{current_url}&start={page_num * 10}"
+                            await page.goto(
+                                new_url, wait_until="networkidle", timeout=60000
+                            )
+                            page_num += 1
+                            next_clicked = True
+                            logger.info(f"Moved to page {page_num} via URL")
+                        except Exception as e:
+                            logger.debug(f"URL navigation also failed: {e}")
+                else:
+                    logger.debug("Next button not found with any selector")
+                    try:
+                        current_url = page.url
+                        if "start=" in current_url:
+                            new_url = re.sub(
+                                r"start=\d+", f"start={page_num * 10}", current_url
+                            )
+                        else:
+                            new_url = f"{current_url}&start={page_num * 10}"
+                        await page.goto(
+                            new_url, wait_until="networkidle", timeout=60000
+                        )
+                        page_num += 1
+                        next_clicked = True
+                        logger.info(f"Moved to page {page_num} via URL")
+                    except Exception as e:
+                        logger.debug(f"URL navigation failed: {e}")
 
             scroll_count += 1
 
@@ -449,18 +1066,20 @@ def process_and_clean_data(raw_data: list[dict[str, Any]]) -> pd.DataFrame:
 
     df = pd.DataFrame(raw_data)
 
-    if "Email" in df.columns:
+    if (
+        "Email" in df.columns
+        and df["Email"].notna().any()
+        and (df["Email"] != "").any()
+    ):
         df = df.drop_duplicates(subset=["Email"], keep="first")
-        df["has_contact"] = (
-            (df["Phone Number"].fillna("").str.len() > 0)
-            | (df["Website"].fillna("").str.len() > 0)
-            | (df["Email"].fillna("").str.len() > 0)
-        )
     else:
-        df = df.drop_duplicates(subset=["Business Name"], keep="first")
-        df["has_contact"] = (df["Phone Number"].fillna("").str.len() > 0) | (
-            df["Website"].fillna("").str.len() > 0
-        )
+        df = df.drop_duplicates(subset=["Website"], keep="first")
+
+    df["has_contact"] = (
+        (df["Phone Number"].fillna("").str.len() > 0)
+        | (df["Website"].fillna("").str.len() > 0)
+        | (df["Email"].fillna("").str.len() > 0)
+    )
 
     df = df[df["has_contact"]].drop(columns=["has_contact"])
 
@@ -485,9 +1104,10 @@ def parse_search_prompt(search_prompt: str) -> dict[str, str]:
         "search_type": "maps",
         "keywords": "",
         "location": "",
+        "target": "email",
     }
 
-    dork_indicators = [
+    email_indicators = [
         "@gmail.com",
         "@yahoo.com",
         "@hotmail.com",
@@ -496,16 +1116,30 @@ def parse_search_prompt(search_prompt: str) -> dict[str, str]:
         "site:",
     ]
 
-    if any(indicator in search_prompt.lower() for indicator in dork_indicators):
+    social_indicators = [
+        "facebook.com",
+        "instagram.com",
+        "fb.com",
+        "fb.me",
+    ]
+
+    prompt_lower = search_prompt.lower()
+
+    if any(indicator in prompt_lower for indicator in social_indicators):
         config["search_type"] = "dork"
         config["keywords"] = search_prompt
+        config["target"] = "profile"
+    elif any(indicator in prompt_lower for indicator in email_indicators):
+        config["search_type"] = "dork"
+        config["keywords"] = search_prompt
+        config["target"] = "email"
     else:
         config["search_type"] = "maps"
-        if " in " in search_prompt.lower():
+        if " in " in prompt_lower:
             parts = search_prompt.split(" in ", 1)
             config["keywords"] = parts[0].strip()
             config["location"] = parts[1].strip()
-        elif " near " in search_prompt.lower():
+        elif " near " in prompt_lower:
             parts = search_prompt.split(" near ", 1)
             config["keywords"] = parts[0].strip()
             config["location"] = parts[1].strip()
@@ -522,38 +1156,87 @@ async def main() -> None:
     print("              LEAD SCRAPING AGENT")
     print("=" * 60)
 
-    print("\n[ENTER SEARCH PROMPT]")
-    print("Examples:")
-    print("  - 'restaurants in New York'     (Google Maps)")
-    print("  - 'real estate @gmail.com'       (Google Dorking)")
-    print("  - 'plumbers @yahoo.com Los Angeles'")
-    print("  - 'hotels contact@*.com'")
-    print("  - 'restaurants near Times Square'")
+    print("\n[SELECT SEARCH ENGINE]")
+    print("  1. Google Maps   - Find businesses by location")
+    print("  2. Google Dork   - Search for emails/contacts (may get CAPTCHA)")
+    print("  3. Yahoo Dork    - Search for emails/contacts")
+    print("  4. Bing Dork     - Search for emails/contacts")
 
-    search_prompt = input("\nEnter search prompt: ").strip()
+    engine_choice = input("\nEnter choice (1/2/3/4): ").strip()
 
-    if not search_prompt:
-        print("[ERROR] No search prompt entered.")
+    engine_map = {
+        "1": ("google_maps", "Google Maps"),
+        "2": ("google_dork", "Google Dork"),
+        "3": ("yahoo_dork", "Yahoo Dork"),
+        "4": ("bing_dork", "Bing Dork"),
+    }
+
+    if engine_choice not in engine_map:
+        print("[ERROR] Invalid choice.")
         return
 
-    parsed = parse_search_prompt(search_prompt)
-    SEARCH_CONFIG["search_type"] = parsed["search_type"]
-    SEARCH_CONFIG["keywords"] = parsed["keywords"]
-    SEARCH_CONFIG["location"] = parsed.get("location", "")
+    SEARCH_CONFIG["search_type"], engine_name = engine_map[engine_choice]
 
-    print(
-        f"\n[DETECTED] {'Google Dorking' if SEARCH_CONFIG['search_type'] == 'dork' else 'Google Maps'} mode"
-    )
+    print(f"\n[SELECTED] {engine_name}")
+
+    if SEARCH_CONFIG["search_type"] == "google_maps":
+        print("\n[ENTER SEARCH PROMPT]")
+        print("Examples:")
+        print("  - 'restaurants in New York'")
+        print("  - 'plumbers near Brooklyn'")
+        print("  - 'coffee shops Los Angeles'")
+
+        search_prompt = input("\nEnter search prompt: ").strip()
+
+        if not search_prompt:
+            print("[ERROR] No search prompt entered.")
+            return
+
+        if " in " in search_prompt.lower():
+            parts = search_prompt.split(" in ", 1)
+            SEARCH_CONFIG["keywords"] = parts[0].strip()
+            SEARCH_CONFIG["location"] = parts[1].strip()
+        elif " near " in search_prompt.lower():
+            parts = search_prompt.split(" near ", 1)
+            SEARCH_CONFIG["keywords"] = parts[0].strip()
+            SEARCH_CONFIG["location"] = parts[1].strip()
+        else:
+            SEARCH_CONFIG["keywords"] = search_prompt
+            SEARCH_CONFIG["location"] = os.getenv("DEFAULT_LOCATION", "New York")
+
+    else:
+        print("\n[ENTER SEARCH PROMPT]")
+        print("Examples:")
+        print("  - 'real estate @gmail.com'")
+        print("  - 'plumbers @yahoo.com Los Angeles'")
+        print("  - 'hotels contact@*.com'")
+        print("  - 'influencers facebook.com'")
+        print("  - 'creators instagram.com'")
+
+        search_prompt = input("\nEnter search prompt: ").strip()
+
+        if not search_prompt:
+            print("[ERROR] No search prompt entered.")
+            return
+
+        parsed = parse_search_prompt(search_prompt)
+        SEARCH_CONFIG["keywords"] = parsed["keywords"]
+        SEARCH_CONFIG["target"] = parsed["target"]
+
+    print("\n[HEADLESS MODE]")
+    print("  y - Run in headless mode (faster, more likely blocked)")
+    print("  n - Run with visible browser (slower, harder to detect)")
+
+    headless_input = input(f"\nHeadless? (y/n, default n): ").strip().lower()
+    headless_mode = headless_input == "y"
+
+    if headless_input != "y" and headless_input != "n":
+        headless_mode = False
 
     try:
-        if SEARCH_CONFIG["search_type"] == "dork":
-            SEARCH_CONFIG["max_scrolls"] = int(
-                input("Page limit (number of pages to scrape): ").strip() or "5"
-            )
-        else:
-            SEARCH_CONFIG["max_scrolls"] = int(
-                input("Max scrolls (default 15): ").strip() or "15"
-            )
+        SEARCH_CONFIG["max_scrolls"] = int(
+            input(f"\nMax scrolls/pages (default 15): ").strip() or "15"
+        )
         SEARCH_CONFIG["results_limit"] = int(
             input("Results limit (default 100): ").strip() or "100"
         )
@@ -561,15 +1244,16 @@ async def main() -> None:
         logger.warning("Invalid numeric input, using defaults")
 
     print("\n" + "=" * 60)
-    print(
-        f"  Search Type:   {'Google Dorking' if SEARCH_CONFIG['search_type'] == 'dork' else 'Google Maps'}"
-    )
-    print(f"  Search Prompt: {search_prompt}")
-    if SEARCH_CONFIG["search_type"] == "maps":
-        print(f"  Keywords:      {SEARCH_CONFIG['keywords']}")
+    print(f"  Search Engine: {engine_name}")
+    print(f"  Keywords:      {SEARCH_CONFIG['keywords']}")
+    if SEARCH_CONFIG["search_type"] == "google_maps":
         print(f"  Location:      {SEARCH_CONFIG['location']}")
-
-    print(f"  Max Scrolls:  {SEARCH_CONFIG['max_scrolls']}")
+    else:
+        target_type = SEARCH_CONFIG.get("target", "email")
+        target_name = "Social Profiles" if target_type == "profile" else "Emails"
+        print(f"  Target:        {target_name}")
+    print(f"  Headless:      {'Yes' if headless_mode else 'No'}")
+    print(f"  Max Scrolls:   {SEARCH_CONFIG['max_scrolls']}")
     print(f"  Results Limit: {SEARCH_CONFIG['results_limit']}")
     print("=" * 60 + "\n")
 
@@ -577,17 +1261,36 @@ async def main() -> None:
 
     raw_results: list[dict[str, str]] = []
     try:
-        if SEARCH_CONFIG["search_type"] == "dork":
-            raw_results = await scrape_google_dork(
-                keywords=SEARCH_CONFIG["keywords"],
-                dork_query="",
-                max_scrolls=SEARCH_CONFIG["max_scrolls"],
-            )
-        else:
+        if SEARCH_CONFIG["search_type"] == "google_maps":
             raw_results = await scrape_google_maps(
                 keywords=SEARCH_CONFIG["keywords"],
                 location=SEARCH_CONFIG["location"],
                 max_scrolls=SEARCH_CONFIG["max_scrolls"],
+                headless=headless_mode,
+            )
+        elif SEARCH_CONFIG["search_type"] == "yahoo_dork":
+            raw_results = await scrape_yahoo_dork(
+                keywords=SEARCH_CONFIG["keywords"],
+                dork_query="",
+                max_scrolls=SEARCH_CONFIG["max_scrolls"],
+                headless=headless_mode,
+                target=SEARCH_CONFIG.get("target", "email"),
+            )
+        elif SEARCH_CONFIG["search_type"] == "google_dork":
+            raw_results = await scrape_google_dork(
+                keywords=SEARCH_CONFIG["keywords"],
+                dork_query="",
+                max_scrolls=SEARCH_CONFIG["max_scrolls"],
+                headless=headless_mode,
+                target=SEARCH_CONFIG.get("target", "email"),
+            )
+        elif SEARCH_CONFIG["search_type"] == "bing_dork":
+            raw_results = await scrape_bing_dork(
+                keywords=SEARCH_CONFIG["keywords"],
+                dork_query="",
+                max_scrolls=SEARCH_CONFIG["max_scrolls"],
+                headless=headless_mode,
+                target=SEARCH_CONFIG.get("target", "email"),
             )
     except KeyboardInterrupt:
         print("\n[!] Scraping interrupted by user")

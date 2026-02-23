@@ -11,6 +11,7 @@ class SearchConfig:
     results_limit: int = 100
     search_type: str = "maps"
     dork_query: str = ""
+    target: str = "email"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -21,6 +22,7 @@ class SearchConfig:
             "results_limit": self.results_limit,
             "search_type": self.search_type,
             "dork_query": self.dork_query,
+            "target": self.target,
         }
 
     @classmethod
